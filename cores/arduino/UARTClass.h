@@ -44,6 +44,8 @@ class UARTClass : public HardwareSerial
     };
     UARTClass(Uart* pUart, IRQn_Type dwIrq, uint32_t dwId, RingBuffer* pRx_buffer, RingBuffer* pTx_buffer);
 
+    void initFlowControl(void);
+
     void begin(const uint32_t dwBaudRate);
     void begin(const uint32_t dwBaudRate, const UARTModes config);
     void end(void);
@@ -64,6 +66,7 @@ class UARTClass : public HardwareSerial
 
   protected:
     void init(const uint32_t dwBaudRate, const uint32_t config);
+    int manageRTS(void);
 
     RingBuffer *_rx_buffer;
     RingBuffer *_tx_buffer;
@@ -71,6 +74,7 @@ class UARTClass : public HardwareSerial
     Uart* _pUart;
     IRQn_Type _dwIrq;
     uint32_t _dwId;
+  
 
 };
 

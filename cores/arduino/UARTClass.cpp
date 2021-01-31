@@ -21,6 +21,42 @@
 #include <string.h>
 #include "UARTClass.h"
 
+#include "Arduino.h"
+#include "config.h"
+
+/*
+From FTDI:
+
+FTxxx RTS# pin is an output. It should be connected to the CTS# input pin of the device at the other end of the UART link.
+If RTS# is logic 0 it is indicating the FTxxx device can accept more data on the RXD pin.
+If RTS# is logic 1 it is indicating the FTxxx device cannot accept more data.
+RTS# changes state when the chip buffer reaches its last 32 bytes of space to allow time for the external device to stop sending data to the FTxxx device.
+FTxxx CTS# pin is an input. It should be connected to the RTS# output pin of the device at the other end of the UART link.
+If CTS# is logic 0 it is indicating the external device can accept more data, and the FTxxx will transmit on the TXD pin.
+If CTS# is logic 1 it is indicating the external device cannot accept more data. the FTxxx will stop transmitting within 0~3 characters, depending on what is in the buffer.
+This potential 3 character overrun does occasionally present problems. Customers shoud be made aware the FTxxx is a USB device and not a "normal" RS232 device as seen on a PC. As such the device operates on a packet basis as opposed to a byte basis.
+Word to the wise. Not only do RS232 level shifting devices (e.g. MAX232) level shift, but they also invert the signal.
+*/
+
+// * IMPORTANT *: 
+// ctsPin must be connected to the RTS output from the FTDI device
+static int ctsPin = FLOW_CONTROL_CTS_PIN;
+// likewise, rtsPin must be connected to the CTS input of the FTDI
+static int rtsPin = FLOW_CONTROL_RTS_PIN;
+
+static volatile bool recvPaused = false;
+static volatile bool sendPaused = false;
+static volatile int ctsStatus = 0;
+
+void _cts_irq(void) {
+  ctsStatus = digitalRead(ctsPin);
+  if (ctsStatus == 1) {
+    sendPaused = true;
+  } else {
+    sendPaused = false;
+  }
+}
+
 // Constructors ////////////////////////////////////////////////////////////////
 
 UARTClass::UARTClass( Uart *pUart, IRQn_Type dwIrq, uint32_t dwId, RingBuffer *pRx_buffer, RingBuffer *pTx_buffer )
@@ -34,6 +70,35 @@ UARTClass::UARTClass( Uart *pUart, IRQn_Type dwIrq, uint32_t dwId, RingBuffer *p
 }
 
 // Public Methods //////////////////////////////////////////////////////////////
+
+int UARTClass::manageRTS(void)
+{
+  unsigned int avail = ((unsigned int)(SERIAL_BUFFER_SIZE + _rx_buffer->_iHead - _rx_buffer->_iTail)) % SERIAL_BUFFER_SIZE;
+
+  if (!recvPaused && (avail >= SERIAL_BUFFER_SIZE)) {
+    recvPaused = true;
+    digitalWrite(rtsPin, 1);
+  } else {      
+    if (recvPaused && (avail <= 0)) {
+      recvPaused = false;
+      digitalWrite(rtsPin, 0);
+    }
+  }
+  
+  return avail;
+}
+
+void UARTClass::initFlowControl(void) {
+  // monitor CTS
+  pinMode(ctsPin, INPUT_PULLUP);
+  _cts_irq();  // initialize ctsStatus
+  attachInterrupt(digitalPinToInterrupt(ctsPin), _cts_irq, CHANGE);
+
+  // assign RTS
+  pinMode(rtsPin, OUTPUT);
+  digitalWrite(rtsPin, 0);  // ready to receive
+}
+
 
 void UARTClass::begin(const uint32_t dwBaudRate)
 {
@@ -61,7 +126,7 @@ void UARTClass::init(const uint32_t dwBaudRate, const uint32_t modeReg)
   _pUart->UART_MR = modeReg;
 
   // Configure baudrate (asynchronous, no oversampling)
-  _pUart->UART_BRGR = (SystemCoreClock / dwBaudRate) >> 4;
+  _pUart->UART_BRGR = (SystemCoreClock / dwBaudRate) >> 4;	
 
   // Configure interrupts
   _pUart->UART_IDR = 0xFFFFFFFF;
@@ -76,6 +141,10 @@ void UARTClass::init(const uint32_t dwBaudRate, const uint32_t modeReg)
 
   // Enable receiver and transmitter
   _pUart->UART_CR = UART_CR_RXEN | UART_CR_TXEN;
+
+  if (FLOW_CONTROL_ENABLED) {
+    initFlowControl();
+  }
 }
 
 void UARTClass::end( void )
@@ -104,7 +173,11 @@ uint32_t UARTClass::getInterruptPriority()
 
 int UARTClass::available( void )
 {
-  return (uint32_t)(SERIAL_BUFFER_SIZE + _rx_buffer->_iHead - _rx_buffer->_iTail) % SERIAL_BUFFER_SIZE;
+  if (FLOW_CONTROL_ENABLED) {
+    return manageRTS();  // manage_rts returns the available space in the buffer
+  } else {
+    return (uint32_t)(SERIAL_BUFFER_SIZE + _rx_buffer->_iHead - _rx_buffer->_iTail) % SERIAL_BUFFER_SIZE;
+  }
 }
 
 int UARTClass::availableForWrite(void)
@@ -120,6 +193,10 @@ int UARTClass::peek( void )
   if ( _rx_buffer->_iHead == _rx_buffer->_iTail )
     return -1;
 
+  if (FLOW_CONTROL_ENABLED) {
+    manageRTS();
+  }
+
   return _rx_buffer->_aucBuffer[_rx_buffer->_iTail];
 }
 
@@ -129,6 +206,10 @@ int UARTClass::read( void )
   if ( _rx_buffer->_iHead == _rx_buffer->_iTail )
     return -1;
 
+  if (FLOW_CONTROL_ENABLED) {
+    manageRTS();
+  }
+
   uint8_t uc = _rx_buffer->_aucBuffer[_rx_buffer->_iTail];
   _rx_buffer->_iTail = (unsigned int)(_rx_buffer->_iTail + 1) % SERIAL_BUFFER_SIZE;
   return uc;
@@ -136,33 +217,27 @@ int UARTClass::read( void )
 
 void UARTClass::flush( void )
 {
-  while (_tx_buffer->_iHead != _tx_buffer->_iTail); //wait for transmit data to be sent
+  while (_tx_buffer->_iHead != _tx_buffer->_iTail); // wait for transmit data to be sent
+
   // Wait for transmission to complete
   while ((_pUart->UART_SR & UART_SR_TXEMPTY) != UART_SR_TXEMPTY)
    ;
 }
 
+
 size_t UARTClass::write( const uint8_t uc_data )
 {
-  // Is the hardware currently busy?
-  if (((_pUart->UART_SR & UART_SR_TXRDY) != UART_SR_TXRDY) |
-      (_tx_buffer->_iTail != _tx_buffer->_iHead))
-  {
-    // If busy we buffer
-    int nextWrite = (_tx_buffer->_iHead + 1) % SERIAL_BUFFER_SIZE;
-    while (_tx_buffer->_iTail == nextWrite)
-      ; // Spin locks if we're about to overwrite the buffer. This continues once the data is sent
+  int nextWrite = (_tx_buffer->_iHead + 1) % SERIAL_BUFFER_SIZE;
+  while (_tx_buffer->_iTail == nextWrite || sendPaused) {
+    ; // Spin locks if we're about to overwrite the buffer. This continues once the data is sent
+  }
 
-    _tx_buffer->_aucBuffer[_tx_buffer->_iHead] = uc_data;
-    _tx_buffer->_iHead = nextWrite;
-    // Make sure TX interrupt is enabled
-    _pUart->UART_IER = UART_IER_TXRDY;
-  }
-  else 
-  {
-     // Bypass buffering and send character directly
-     _pUart->UART_THR = uc_data;
-  }
+  _tx_buffer->_aucBuffer[_tx_buffer->_iHead] = uc_data;
+  _tx_buffer->_iHead = nextWrite;
+
+  // Make sure TX interrupt is enabled
+  _pUart->UART_IER = UART_IER_TXRDY;
+
   return 1;
 }
 
@@ -195,4 +270,3 @@ void UARTClass::IrqHandler( void )
     _pUart->UART_CR |= UART_CR_RSTSTA;
   }
 }
-
